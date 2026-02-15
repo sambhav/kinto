@@ -1,26 +1,9 @@
 --
--- Convert as_epoch/from_epoch from PL/pgSQL to SQL language.
--- This allows PostgreSQL to inline the function body into query plans,
--- eliminating per-call overhead for these frequently-called functions.
+-- Drop idx_objects_last_modified_epoch since after moving as_epoch() to the
+-- value side of comparisons, no queries reference as_epoch(last_modified)
+-- in WHERE clauses. The composite index (parent_id, resource_name,
+-- last_modified DESC) covers all query patterns.
 --
-CREATE OR REPLACE FUNCTION as_epoch(ts TIMESTAMP) RETURNS BIGINT AS $$
-    SELECT (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT;
-$$ LANGUAGE SQL
-IMMUTABLE;
-
-CREATE OR REPLACE FUNCTION from_epoch(epoch BIGINT) RETURNS TIMESTAMP AS $$
-    SELECT TIMESTAMP WITH TIME ZONE 'epoch' + epoch * INTERVAL '1 millisecond';
-$$ LANGUAGE SQL
-IMMUTABLE;
-
---
--- Rebuild the expression index so it reflects the new function definition.
--- Then drop it, since after moving as_epoch() to the value side of comparisons,
--- no queries reference as_epoch(last_modified) in WHERE clauses.
--- The composite index (parent_id, resource_name, last_modified DESC) covers
--- all query patterns.
---
-REINDEX INDEX idx_objects_last_modified_epoch;
 DROP INDEX IF EXISTS idx_objects_last_modified_epoch;
 
 --
