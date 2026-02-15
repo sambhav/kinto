@@ -291,6 +291,357 @@ class PostgreSQLStorageTest(StorageTest, unittest.TestCase):
         self.backend.load_from_config(config)  # does not raise
 
 
+@skip_if_no_postgresql
+class PostgreSQLLastModifiedFilterTest(unittest.TestCase):
+    """Tests for the from_epoch() optimization on last_modified queries.
+
+    Verifies that moving as_epoch() from the column side to from_epoch()
+    on the value side produces correct results for every comparison operator.
+    """
+
+    backend = postgresql
+    settings = {
+        "storage_max_fetch_size": 10000,
+        "storage_backend": "kinto.core.storage.postgresql",
+        "storage_poolclass": "sqlalchemy.pool.StaticPool",
+        "storage_url": "postgresql://postgres:postgres@localhost:5432/testdb",
+    }
+
+    def setUp(self):
+        from pyramid import testing as pyramid_testing
+
+        config = pyramid_testing.setUp()
+        config.add_settings(self.settings)
+        self.storage = self.backend.load_from_config(config)
+        self.storage.initialize_schema()
+        self.storage_kw = {"resource_name": "test", "parent_id": "parent1"}
+
+        # Create objects with known timestamps by using the storage API
+        import time
+
+        self.objects = []
+        for i in range(5):
+            obj = self.storage.create(obj={"index": i}, **self.storage_kw)
+            self.objects.append(obj)
+            time.sleep(0.01)
+
+    def tearDown(self):
+        self.storage.flush()
+
+    # --- Scalar comparison operators on last_modified ---
+
+    def test_filter_gt_last_modified(self):
+        """GT filter with from_epoch() returns only later objects."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.GT)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        for obj in self.objects[:3]:
+            self.assertNotIn(obj["id"], result_ids)
+        for obj in self.objects[3:]:
+            self.assertIn(obj["id"], result_ids)
+
+    def test_filter_lt_last_modified(self):
+        """LT filter with from_epoch() returns only earlier objects."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.LT)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        for obj in self.objects[:2]:
+            self.assertIn(obj["id"], result_ids)
+        for obj in self.objects[2:]:
+            self.assertNotIn(obj["id"], result_ids)
+
+    def test_filter_min_last_modified(self):
+        """MIN (>=) filter with from_epoch() includes the boundary."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.MIN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        self.assertIn(self.objects[2]["id"], result_ids)
+        for obj in self.objects[3:]:
+            self.assertIn(obj["id"], result_ids)
+        for obj in self.objects[:2]:
+            self.assertNotIn(obj["id"], result_ids)
+
+    def test_filter_max_last_modified(self):
+        """MAX (<=) filter with from_epoch() includes the boundary."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.MAX)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        for obj in self.objects[:3]:
+            self.assertIn(obj["id"], result_ids)
+        for obj in self.objects[3:]:
+            self.assertNotIn(obj["id"], result_ids)
+
+    def test_filter_eq_last_modified(self):
+        """EQ filter with from_epoch() matches exactly one object."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.EQ)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], self.objects[2]["id"])
+
+    def test_filter_not_last_modified(self):
+        """NOT filter with from_epoch() excludes exactly one object."""
+        ts = self.objects[2]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.NOT)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        self.assertEqual(len(results), 4)
+        self.assertNotIn(self.objects[2]["id"], result_ids)
+
+    # --- IN / EXCLUDE operators (tuple expansion) ---
+
+    def test_filter_in_last_modified(self):
+        """IN filter expands each epoch value with from_epoch()."""
+        timestamps = [self.objects[1]["last_modified"], self.objects[3]["last_modified"]]
+        filters = [Filter("last_modified", timestamps, COMPARISON.IN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        self.assertEqual(len(results), 2)
+        self.assertIn(self.objects[1]["id"], result_ids)
+        self.assertIn(self.objects[3]["id"], result_ids)
+
+    def test_filter_in_last_modified_single_value(self):
+        """IN filter with a single value works correctly."""
+        timestamps = [self.objects[0]["last_modified"]]
+        filters = [Filter("last_modified", timestamps, COMPARISON.IN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], self.objects[0]["id"])
+
+    def test_filter_in_last_modified_empty_list(self):
+        """IN filter with empty list returns no results."""
+        filters = [Filter("last_modified", [], COMPARISON.IN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 0)
+
+    def test_filter_in_last_modified_all_values(self):
+        """IN filter with all timestamps returns all objects."""
+        timestamps = [obj["last_modified"] for obj in self.objects]
+        filters = [Filter("last_modified", timestamps, COMPARISON.IN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 5)
+
+    def test_filter_in_last_modified_nonexistent_value(self):
+        """IN filter with a value that doesn't match returns nothing."""
+        filters = [Filter("last_modified", [9999999999999], COMPARISON.IN)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 0)
+
+    def test_filter_exclude_last_modified(self):
+        """EXCLUDE filter with from_epoch() tuple expansion."""
+        timestamps = [self.objects[1]["last_modified"], self.objects[3]["last_modified"]]
+        filters = [Filter("last_modified", timestamps, COMPARISON.EXCLUDE)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        self.assertEqual(len(results), 3)
+        self.assertNotIn(self.objects[1]["id"], result_ids)
+        self.assertNotIn(self.objects[3]["id"], result_ids)
+
+    def test_filter_exclude_last_modified_empty_list(self):
+        """EXCLUDE with empty list.
+
+        Empty tuples are rewritten to (None,) to avoid SQL syntax errors.
+        NOT IN (NULL) evaluates to NULL (falsy) for every row, so no
+        results are returned.  This is pre-existing behaviour.
+        """
+        filters = [Filter("last_modified", [], COMPARISON.EXCLUDE)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 0)
+
+    # --- Combined filters ---
+
+    def test_combined_range_filters_on_last_modified(self):
+        """MIN and MAX filters together select a range (inclusive)."""
+        ts_low = self.objects[1]["last_modified"]
+        ts_high = self.objects[3]["last_modified"]
+        filters = [
+            Filter("last_modified", ts_low, COMPARISON.MIN),
+            Filter("last_modified", ts_high, COMPARISON.MAX),
+        ]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        result_ids = {r["id"] for r in results}
+        self.assertEqual(len(results), 3)
+        for obj in self.objects[1:4]:
+            self.assertIn(obj["id"], result_ids)
+
+    def test_filter_last_modified_with_count(self):
+        """count_all returns same count as len(list_all) for GT filter."""
+        ts = self.objects[1]["last_modified"]
+        filters = [Filter("last_modified", ts, COMPARISON.GT)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        count = self.storage.count_all(filters=filters, **self.storage_kw)
+        self.assertEqual(count, len(results))
+        self.assertEqual(count, 3)
+
+    def test_filter_last_modified_does_not_affect_other_fields(self):
+        """Filters on non-modified fields are unaffected by the changes."""
+        filters = [Filter("index", 2, COMPARISON.EQ)]
+        results = self.storage.list_all(filters=filters, **self.storage_kw)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["index"], 2)
+
+    # --- Sorting on last_modified ---
+
+    def test_sort_by_last_modified_ascending(self):
+        """Sorting by last_modified ASC returns objects in creation order."""
+        sorting = [Sort("last_modified", 1)]
+        results = self.storage.list_all(sorting=sorting, **self.storage_kw)
+        timestamps = [r["last_modified"] for r in results]
+        self.assertEqual(timestamps, sorted(timestamps))
+
+    def test_sort_by_last_modified_descending(self):
+        """Sorting by last_modified DESC returns objects in reverse order."""
+        sorting = [Sort("last_modified", -1)]
+        results = self.storage.list_all(sorting=sorting, **self.storage_kw)
+        timestamps = [r["last_modified"] for r in results]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+
+    # --- purge_deleted with from_epoch() ---
+
+    def test_purge_deleted_with_before_timestamp(self):
+        """purge_deleted uses from_epoch(:before) correctly."""
+        import time
+
+        # Use a dedicated parent_id to avoid interference from setUp objects.
+        purge_kw = {"resource_name": "test", "parent_id": "purge_test1"}
+
+        # Create and delete an object (produces a tombstone).
+        obj1 = self.storage.create(obj={"val": 1}, **purge_kw)
+        tombstone1 = self.storage.delete(object_id=obj1["id"], **purge_kw)
+        time.sleep(0.01)
+
+        # Create and delete another (later tombstone).
+        obj2 = self.storage.create(obj={"val": 2}, **purge_kw)
+        tombstone2 = self.storage.delete(object_id=obj2["id"], **purge_kw)
+        time.sleep(0.01)
+
+        # Use a boundary between the two tombstones (strictly after the first).
+        boundary_ts = tombstone1["last_modified"] + 1
+
+        # Purge only rows before boundary — should remove the first tombstone.
+        num_purged = self.storage.purge_deleted(before=boundary_ts, **purge_kw)
+        self.assertEqual(num_purged, 1)
+
+        # The later tombstone should still exist.
+        all_with_deleted = self.storage.list_all(
+            include_deleted=True,
+            filters=[Filter("last_modified", boundary_ts, COMPARISON.MIN)],
+            **purge_kw,
+        )
+        tombstones = [r for r in all_with_deleted if r.get("deleted")]
+        self.assertGreaterEqual(len(tombstones), 1)
+
+    def test_purge_deleted_at_exact_boundary(self):
+        """purge_deleted with before= exactly at a tombstone's timestamp.
+
+        The condition is last_modified < from_epoch(:before), so the
+        tombstone at the exact boundary should NOT be purged.
+        """
+        import time
+
+        purge_kw = {"resource_name": "test", "parent_id": "purge_test2"}
+
+        obj = self.storage.create(obj={"val": 1}, **purge_kw)
+        deleted = self.storage.delete(object_id=obj["id"], **purge_kw)
+        tombstone_ts = deleted["last_modified"]
+        time.sleep(0.01)
+
+        num_purged = self.storage.purge_deleted(before=tombstone_ts, **purge_kw)
+        # The tombstone at exactly the boundary should not be purged (strict <).
+        self.assertEqual(num_purged, 0)
+
+    # --- resource_timestamp ORDER BY ---
+
+    def test_resource_timestamp_returns_latest(self):
+        """resource_timestamp returns the highest timestamp after ORDER BY change."""
+        ts = self.storage.resource_timestamp(**self.storage_kw)
+        latest_obj_ts = max(obj["last_modified"] for obj in self.objects)
+        self.assertGreaterEqual(ts, latest_obj_ts)
+
+    def test_resource_timestamp_after_delete_is_monotonic(self):
+        """resource_timestamp stays monotonically increasing after deletions."""
+        import time
+
+        ts_before = self.storage.resource_timestamp(**self.storage_kw)
+        last_obj = self.objects[-1]
+        time.sleep(0.01)
+        self.storage.delete(object_id=last_obj["id"], **self.storage_kw)
+        ts_after = self.storage.resource_timestamp(**self.storage_kw)
+        self.assertGreater(ts_after, ts_before)
+
+    # --- bump_timestamp trigger ---
+
+    def test_bump_timestamp_creates_monotonic_timestamps(self):
+        """Records created in sequence get strictly increasing timestamps."""
+        timestamps = []
+        for i in range(10):
+            obj = self.storage.create(obj={"seq": i}, **self.storage_kw)
+            timestamps.append(obj["last_modified"])
+        # All timestamps must be strictly increasing.
+        for i in range(1, len(timestamps)):
+            self.assertGreater(timestamps[i], timestamps[i - 1])
+
+    def test_bump_timestamp_on_update(self):
+        """An update bumps the last_modified value."""
+        obj = self.objects[0]
+        old_ts = obj["last_modified"]
+        updated = self.storage.update(
+            object_id=obj["id"], obj={"index": 0, "extra": True}, **self.storage_kw
+        )
+        self.assertGreater(updated["last_modified"], old_ts)
+
+    # --- Pagination with last_modified ---
+
+    def test_pagination_on_last_modified(self):
+        """Pagination rules using last_modified work with from_epoch()."""
+        # Get first 2 objects sorted by last_modified ASC
+        sorting = [Sort("last_modified", 1)]
+        first_page = self.storage.list_all(
+            sorting=sorting, limit=2, **self.storage_kw
+        )
+        self.assertEqual(len(first_page), 2)
+
+        # Paginate: get objects after the last one on the first page
+        pagination_rules = [[
+            Filter("last_modified", first_page[-1]["last_modified"], COMPARISON.GT),
+        ]]
+        second_page = self.storage.list_all(
+            sorting=sorting, limit=2, pagination_rules=pagination_rules, **self.storage_kw
+        )
+        self.assertEqual(len(second_page), 2)
+
+        # No overlap between pages
+        first_ids = {r["id"] for r in first_page}
+        second_ids = {r["id"] for r in second_page}
+        self.assertEqual(len(first_ids & second_ids), 0)
+
+    # --- Index verification ---
+
+    def test_expression_index_does_not_exist(self):
+        """The old idx_objects_last_modified_epoch index was dropped."""
+        with self.storage.client.connect(readonly=True) as conn:
+            result = conn.execute(sa.text("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_objects_last_modified_epoch'
+            """))
+            rows = result.fetchall()
+        self.assertEqual(len(rows), 0)
+
+    def test_composite_index_exists(self):
+        """The composite index on (parent_id, resource_name, last_modified) exists."""
+        with self.storage.client.connect(readonly=True) as conn:
+            result = conn.execute(sa.text("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_objects_parent_id_resource_name_last_modified'
+            """))
+            rows = result.fetchall()
+        self.assertEqual(len(rows), 1)
+
+
 class PaginatedTest(unittest.TestCase):
     def setUp(self):
         self.storage = mock.Mock()
