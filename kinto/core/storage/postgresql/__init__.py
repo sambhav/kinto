@@ -79,7 +79,7 @@ class Storage(StorageBase, MigratorMixin):
 
     # MigratorMixin attributes.
     name = "storage"
-    schema_version = 25
+    schema_version = 26
     schema_file = os.path.join(HERE, "schema.sql")
     migrations_directory = os.path.join(HERE, "migrations")
 
@@ -201,7 +201,7 @@ class Storage(StorageBase, MigratorMixin):
             FROM objects
             WHERE parent_id = :parent_id
               AND resource_name = :resource_name
-            ORDER BY as_epoch(last_modified) DESC
+            ORDER BY last_modified DESC
             LIMIT 1
           )
           -- Timestamp of empty resource.
@@ -658,7 +658,7 @@ class Storage(StorageBase, MigratorMixin):
             safeholders["resource_name_filter"] = "AND resource_name = :resource_name"  # NOQA
 
         if before is not None:
-            safeholders["conditions_filter"] = "AND as_epoch(last_modified) < :before"
+            safeholders["conditions_filter"] = "AND last_modified < from_epoch(:before)"
             placeholders["before"] = before
 
         with self.client.connect(force_commit=True) as conn:
@@ -875,12 +875,14 @@ class Storage(StorageBase, MigratorMixin):
             value = filtr.value
             is_like_query = filtr.operator == COMPARISON.LIKE
 
+            is_modified_field = False
             if filtr.field == id_field:
                 sql_field = "id"
                 if isinstance(value, int):
                     value = str(value)
             elif filtr.field == modified_field:
-                sql_field = "as_epoch(last_modified)"
+                sql_field = "last_modified"
+                is_modified_field = True
             else:
                 column_name = "data"
                 # Subfields: ``person.name`` becomes ``data->person->>name``
@@ -952,7 +954,17 @@ class Storage(StorageBase, MigratorMixin):
                 holders[value_holder] = value
 
                 sql_operator = operators.setdefault(filtr.operator, filtr.operator.value)
-                cond = f"{sql_field} {sql_operator} :{value_holder}"
+                # Convert epoch value to timestamp so PostgreSQL can use
+                # the index on last_modified directly.
+                if is_modified_field and filtr.operator not in (COMPARISON.IN, COMPARISON.EXCLUDE):
+                    sql_value = f"from_epoch(:{value_holder})"
+                    cond = f"{sql_field} {sql_operator} {sql_value}"
+                elif is_modified_field:
+                    # IN/EXCLUDE operate on tuples; use as_epoch() on the
+                    # column side since from_epoch() can't wrap a tuple.
+                    cond = f"as_epoch({sql_field}) {sql_operator} :{value_holder}"
+                else:
+                    cond = f"{sql_field} {sql_operator} :{value_holder}"
 
             # If the field is missing, column_name will produce
             # NULL. NULL has strange properties with comparisons

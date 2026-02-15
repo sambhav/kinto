@@ -6,17 +6,13 @@ SET client_min_messages TO ERROR;
 -- Convert timestamps to milliseconds epoch integer
 --
 CREATE OR REPLACE FUNCTION as_epoch(ts TIMESTAMP) RETURNS BIGINT AS $$
-BEGIN
-    RETURN (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT;
-END;
-$$ LANGUAGE plpgsql
+    SELECT (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT;
+$$ LANGUAGE SQL
 IMMUTABLE;
 
 CREATE OR REPLACE FUNCTION from_epoch(epoch BIGINT) RETURNS TIMESTAMP AS $$
-BEGIN
-    RETURN TIMESTAMP WITH TIME ZONE 'epoch' + epoch * INTERVAL '1 millisecond';
-END;
-$$ LANGUAGE plpgsql
+    SELECT TIMESTAMP WITH TIME ZONE 'epoch' + epoch * INTERVAL '1 millisecond';
+$$ LANGUAGE SQL
 IMMUTABLE;
 
 --
@@ -45,8 +41,6 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_parent_id_resource_name_last_modified
     ON objects(parent_id, resource_name, last_modified DESC);
-CREATE INDEX IF NOT EXISTS idx_objects_last_modified_epoch
-    ON objects(as_epoch(last_modified));
 CREATE INDEX IF NOT EXISTS idx_objects_resource_name_parent_id_deleted
     ON objects(resource_name, parent_id, deleted);
 -- Index for collections timestamps
@@ -84,7 +78,7 @@ BEGIN
         FROM objects
         WHERE parent_id = NEW.parent_id
           AND resource_name = NEW.resource_name
-        ORDER BY as_epoch(last_modified) DESC
+        ORDER BY last_modified DESC
         LIMIT 1
       )
       -- Timestamp when resource was empty.
@@ -140,4 +134,4 @@ INSERT INTO metadata (name, value) VALUES ('created_at', NOW()::TEXT);
 
 -- Set storage schema version.
 -- Should match ``kinto.core.storage.postgresql.PostgreSQL.schema_version``
-INSERT INTO metadata (name, value) VALUES ('storage_schema_version', '25');
+INSERT INTO metadata (name, value) VALUES ('storage_schema_version', '26');
