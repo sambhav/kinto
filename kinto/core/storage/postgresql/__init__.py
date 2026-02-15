@@ -956,13 +956,22 @@ class Storage(StorageBase, MigratorMixin):
                 sql_operator = operators.setdefault(filtr.operator, filtr.operator.value)
                 # Convert epoch value to timestamp so PostgreSQL can use
                 # the index on last_modified directly.
-                if is_modified_field and filtr.operator not in (COMPARISON.IN, COMPARISON.EXCLUDE):
+                if is_modified_field and filtr.operator in (COMPARISON.IN, COMPARISON.EXCLUDE):
+                    # IN/EXCLUDE operate on tuples.  Expand the tuple
+                    # and wrap each element in from_epoch() so the raw
+                    # last_modified column is compared, keeping the
+                    # composite index usable.
+                    del holders[value_holder]
+                    parts = []
+                    for k, v in enumerate(value):
+                        h = f"{value_holder}_{k}"
+                        holders[h] = v
+                        parts.append(f"from_epoch(:{h})")
+                    in_list = ", ".join(parts)
+                    cond = f"{sql_field} {sql_operator} ({in_list})"
+                elif is_modified_field:
                     sql_value = f"from_epoch(:{value_holder})"
                     cond = f"{sql_field} {sql_operator} {sql_value}"
-                elif is_modified_field:
-                    # IN/EXCLUDE operate on tuples; use as_epoch() on the
-                    # column side since from_epoch() can't wrap a tuple.
-                    cond = f"as_epoch({sql_field}) {sql_operator} :{value_holder}"
                 else:
                     cond = f"{sql_field} {sql_operator} :{value_holder}"
 
