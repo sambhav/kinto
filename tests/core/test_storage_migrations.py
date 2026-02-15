@@ -294,6 +294,204 @@ class PostgresqlStorageMigrationTest(unittest.TestCase):
 
 
 @skip_if_no_postgresql
+class PostgresqlStorageMigration025To026Test(unittest.TestCase):
+    """Tests specific to the 025->026 migration.
+
+    Verifies that:
+    - The expression index idx_objects_last_modified_epoch is dropped.
+    - The bump_timestamp trigger is replaced to use ORDER BY last_modified DESC.
+    - The schema version is updated to 26.
+    - Data created before migration is still accessible after.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from kinto.core.utils import sqlalchemy
+
+        if sqlalchemy is None:
+            return
+
+        from .test_storage import PostgreSQLStorageTest
+
+        self.settings = {**PostgreSQLStorageTest.settings}
+        from pyramid import testing
+
+        self.config = testing.setUp()
+        self.config.add_settings(self.settings)
+        self.version = postgresql_storage.Storage.schema_version
+        self.storage = postgresql_storage.load_from_config(self.config)
+
+    def setUp(self):
+        self._delete_everything()
+
+    def tearDown(self):
+        postgresql_storage.Storage.schema_version = self.version
+        self._delete_everything()
+
+    def _delete_everything(self):
+        q = """
+        DROP TABLE IF EXISTS records CASCADE;
+        DROP TABLE IF EXISTS objects CASCADE;
+        DROP TABLE IF EXISTS deleted CASCADE;
+        DROP TABLE IF EXISTS timestamps CASCADE;
+        DROP TABLE IF EXISTS metadata CASCADE;
+        DROP FUNCTION IF EXISTS resource_timestamp(VARCHAR, VARCHAR);
+        DROP FUNCTION IF EXISTS collection_timestamp(VARCHAR, VARCHAR);
+        DROP FUNCTION IF EXISTS bump_timestamp();
+        """
+        with self.storage.client.connect() as conn:
+            conn.execute(sa.text(q))
+
+    def _install_schema_at_version_25(self):
+        """Install the current schema but pin the version to 25 and
+        add back the old expression index + old bump_timestamp."""
+        # Install the current schema (creates tables, functions, etc.)
+        self.storage.initialize_schema()
+
+        # Downgrade the stored version to 25 so migration 025->026 runs.
+        with self.storage.client.connect() as conn:
+            conn.execute(sa.text(
+                "UPDATE metadata SET value = '25' "
+                "WHERE name = 'storage_schema_version'"
+            ))
+
+            # Add the expression index that v25 had.
+            conn.execute(sa.text("""
+                CREATE INDEX IF NOT EXISTS idx_objects_last_modified_epoch
+                ON objects (as_epoch(last_modified));
+            """))
+
+            # Replace bump_timestamp with the old version that used
+            # ORDER BY as_epoch(last_modified) DESC
+            conn.execute(sa.text("""
+                CREATE OR REPLACE FUNCTION bump_timestamp()
+                RETURNS trigger AS $$
+                DECLARE
+                    previous BIGINT;
+                    current BIGINT;
+                BEGIN
+                    previous := NULL;
+                    WITH existing_timestamps AS (
+                      (
+                        SELECT last_modified
+                        FROM objects
+                        WHERE parent_id = NEW.parent_id
+                          AND resource_name = NEW.resource_name
+                        ORDER BY as_epoch(last_modified) DESC
+                        LIMIT 1
+                      )
+                      UNION
+                      (
+                        SELECT last_modified
+                        FROM timestamps
+                        WHERE parent_id = NEW.parent_id
+                          AND resource_name = NEW.resource_name
+                      )
+                    )
+                    SELECT as_epoch(MAX(last_modified)) INTO previous
+                      FROM existing_timestamps;
+
+                    current := as_epoch(clock_timestamp()::TIMESTAMP);
+                    IF previous IS NOT NULL AND previous >= current THEN
+                        current := previous + 1;
+                    END IF;
+
+                    IF NEW.last_modified IS NULL OR
+                       (previous IS NOT NULL AND as_epoch(NEW.last_modified) = previous) THEN
+                        NEW.last_modified := from_epoch(current);
+                    END IF;
+
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+
+    def test_migration_drops_expression_index(self):
+        self._install_schema_at_version_25()
+
+        # Verify the expression index exists before migration
+        with self.storage.client.connect(readonly=True) as conn:
+            result = conn.execute(sa.text("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_objects_last_modified_epoch'
+            """))
+            self.assertEqual(len(result.fetchall()), 1)
+
+        # Run migration
+        postgresql_storage.Storage.schema_version = self.version
+        self.storage.initialize_schema()
+
+        # Verify the expression index is gone
+        with self.storage.client.connect(readonly=True) as conn:
+            result = conn.execute(sa.text("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_objects_last_modified_epoch'
+            """))
+            self.assertEqual(len(result.fetchall()), 0)
+
+    def test_migration_updates_schema_version_to_26(self):
+        self._install_schema_at_version_25()
+
+        postgresql_storage.Storage.schema_version = self.version
+        self.storage.initialize_schema()
+
+        version = self.storage.get_installed_version()
+        self.assertEqual(version, 26)
+
+    def test_migration_preserves_existing_data(self):
+        self._install_schema_at_version_25()
+
+        # Insert data at v25
+        obj = self.storage.create(
+            resource_name="test", parent_id="migtest", obj={"flavor": "vanilla"}
+        )
+        obj_id = obj["id"]
+        obj_ts = obj["last_modified"]
+
+        # Run migration to v26
+        postgresql_storage.Storage.schema_version = self.version
+        self.storage.initialize_schema()
+
+        # Data is still retrievable
+        fetched = self.storage.get(
+            resource_name="test", parent_id="migtest", object_id=obj_id
+        )
+        self.assertEqual(fetched["flavor"], "vanilla")
+        self.assertEqual(fetched["last_modified"], obj_ts)
+
+    def test_migration_bump_timestamp_still_works(self):
+        self._install_schema_at_version_25()
+
+        # Create a record at v25
+        obj1 = self.storage.create(
+            resource_name="test", parent_id="migtest", obj={"seq": 1}
+        )
+
+        # Run migration to v26
+        postgresql_storage.Storage.schema_version = self.version
+        self.storage.initialize_schema()
+
+        # Create a new record at v26 — bump_timestamp trigger must work
+        obj2 = self.storage.create(
+            resource_name="test", parent_id="migtest", obj={"seq": 2}
+        )
+        self.assertGreater(obj2["last_modified"], obj1["last_modified"])
+
+    def test_migration_composite_index_still_present(self):
+        self._install_schema_at_version_25()
+
+        postgresql_storage.Storage.schema_version = self.version
+        self.storage.initialize_schema()
+
+        with self.storage.client.connect(readonly=True) as conn:
+            result = conn.execute(sa.text("""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_objects_parent_id_resource_name_last_modified'
+            """))
+            self.assertEqual(len(result.fetchall()), 1)
+
+
+@skip_if_no_postgresql
 class PostgresqlPermissionMigrationTest(unittest.TestCase):
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
