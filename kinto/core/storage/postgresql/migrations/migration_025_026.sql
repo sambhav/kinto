@@ -10,6 +10,8 @@ DROP INDEX IF EXISTS idx_objects_last_modified_epoch;
 -- Replace bump_timestamp trigger to use ORDER BY last_modified DESC
 -- instead of ORDER BY as_epoch(last_modified) DESC, enabling index usage.
 --
+DROP TRIGGER IF EXISTS tgr_objects_last_modified ON objects;
+
 CREATE OR REPLACE FUNCTION bump_timestamp()
 RETURNS trigger AS $$
 DECLARE
@@ -63,6 +65,10 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tgr_objects_last_modified
+BEFORE INSERT OR UPDATE OF data ON objects
+FOR EACH ROW EXECUTE PROCEDURE bump_timestamp();
 
 -- Bump storage schema version.
 INSERT INTO metadata (name, value) VALUES ('storage_schema_version', '26');
